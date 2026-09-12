@@ -1,0 +1,8 @@
+## Interface: 11200
+## Author: Cletu
+## Title: Unitscan Soft|cffff8000Turtle-HC
+## Version: 3
+## Notes: Unit scanner with flashy alert and customizable settings
+## SavedVariables: unitscan_targets, unitscan_minlevel, unitscan_wf
+unitscan.lua
+zonetargets.lua
