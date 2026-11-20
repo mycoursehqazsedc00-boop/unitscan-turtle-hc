@@ -68,15 +68,14 @@ MODS.SuperWoW = (SUPERWOW_VERSION ~= nil) or (SUPERWOW_STRING ~= nil)
 -- nampower's GUID getter has been named both UnitGUID and GetUnitGUID across
 -- versions (its own changelog shows the migration) — check both.
 local GetGUID = UnitGUID or GetUnitGUID
-MODS.Nampower = (GetGUID ~= nil) or (type(GetCVar) == 'function' and GetCVar('NP_SpellQueueWindowMs') ~= nil)
+MODS.Nampower = (type(GetNampowerVersion) == 'function') or (GetGUID ~= nil) or (type(GetCVar) == 'function' and GetCVar('NP_SpellQueueWindowMs') ~= nil)
 
 -- UnitXP_SP3's own documented existence check.
 MODS.UnitXP = (type(UnitXP) == 'function') and pcall(UnitXP, 'nop', 'nop')
 
--- ClassicAPI: probe for a nameplate token actually resolving. C_NamePlate
--- existing is a good hint too but the token is what we actually need.
-MODS.ClassicAPI = (C_NamePlate ~= nil) or (type(UnitExists) == 'function' and (function()
-	local ok, exists = pcall(UnitExists, 'nameplate1')
+-- ClassicAPI: check CLASSIC_API_VERSION, C_NamePlate, or nameplate1 token.
+MODS.ClassicAPI = (CLASSIC_API_VERSION ~= nil) or (C_NamePlate ~= nil) or (type(UnitExists) == 'function' and (function()
+	local ok = pcall(UnitExists, 'nameplate1')
 	return ok
 end)())
 
@@ -116,12 +115,14 @@ unitscan:SetScript('OnEvent', function()
 	if event == "VARIABLES_LOADED" then
 		unitscan.LOAD()
 		unitscan.scan = true
+		unitscan.last_check = 0
 	elseif event == "PLAYER_REGEN_DISABLED" then
 		unitscan.incombat = true
 		unitscan.scan = nil
 	elseif event == "PLAYER_REGEN_ENABLED" then
 		unitscan.incombat = nil
 		unitscan.scan = true
+		unitscan.last_check = 0
 	elseif (event == "PLAYER_ENTER_COMBAT" or event == "START_AUTOREPEAT_SPELL") then
 		if not unitscan.incombat then
 			unitscan.scan = nil
@@ -129,6 +130,7 @@ unitscan:SetScript('OnEvent', function()
 	elseif (event == "STOP_AUTOREPEAT_SPELL" or event == "PLAYER_LEAVE_COMBAT") then
 		if not unitscan.incombat then
 			unitscan.scan = true
+			unitscan.last_check = 0
 		end
 	elseif event == "UNIT_DIED" then
 		-- nampower-only event. arg1 is a GUID; if it matches the unit we're
@@ -146,9 +148,20 @@ unitscan:SetScript('OnEvent', function()
 		-- (a per-frame diff internally, not a poll we're piggybacking on).
 		-- arg1 is the "nameplateN" token for the unit that just appeared --
 		-- check just that one unit immediately instead of waiting for the
-		-- once-a-second sweep in unitscan.UPDATE.
+		-- polling sweep in unitscan.UPDATE.
 		if unitscan.scan then
 			unitscan.check_single_nameplate(arg1)
+		end
+	elseif event == "UNIT_NAME_UPDATE_GUID" or event == "UNIT_HEALTH_GUID" or event == "UNIT_AURA_GUID" or event == "UNIT_COMBAT_GUID" then
+		-- nampower GUID events: passive long-range detection without TargetByName.
+		-- Skip player (arg2 == 1) and player pet (arg5 == 1).
+		if unitscan.scan and arg1 and arg2 ~= 1 and arg5 ~= 1 then
+			unitscan.check_guid(arg1)
+		end
+	elseif event == "UNIT_CASTEVENT" then
+		-- SuperWoW event: arg1 is casterGUID; passive long-range detection.
+		if unitscan.scan and arg1 then
+			unitscan.check_guid(arg1)
 		end
 	else
 		unitscan.load_zonetargets()
@@ -165,6 +178,13 @@ unitscan:RegisterEvent'START_AUTOREPEAT_SPELL'
 unitscan:RegisterEvent'STOP_AUTOREPEAT_SPELL'
 if MODS.Nampower then
 	unitscan:RegisterEvent'UNIT_DIED'
+	unitscan:RegisterEvent'UNIT_NAME_UPDATE_GUID'
+	unitscan:RegisterEvent'UNIT_HEALTH_GUID'
+	unitscan:RegisterEvent'UNIT_AURA_GUID'
+	unitscan:RegisterEvent'UNIT_COMBAT_GUID'
+end
+if MODS.SuperWoW then
+	unitscan:RegisterEvent'UNIT_CASTEVENT'
 end
 if MODS.ClassicAPI then
 	unitscan:RegisterEvent'NAME_PLATE_UNIT_ADDED'
@@ -172,8 +192,15 @@ end
 
 local BROWN = {.7, .15, .05}
 local YELLOW = {1, 1, .15}
-local CHECK_INTERVAL = 1
-local MAX_NAMEPLATES = 40 -- loop bound for nameplate1..N; cheap even when unused
+local CHECK_INTERVAL = 0.25 -- faster nameplate safety-net sweep (zero GC alloc)
+local LEGACY_TICK_INTERVAL = 0.05 -- time-sliced legacy scan tick
+local LEGACY_BATCH_SIZE = 2 -- max TargetByName calls per legacy tick to prevent FPS spikes
+local MAX_NAMEPLATES = 40 -- loop bound for nameplate1..N
+local NAMEPLATE_TOKENS = {}
+for i = 1, MAX_NAMEPLATES do
+	NAMEPLATE_TOKENS[i] = "nameplate" .. i
+end
+local HAS_GET_NAMEPLATES = (C_NamePlate ~= nil and type(C_NamePlate.GetNamePlates) == 'function')
 
 unitscan_targets = {}
 unitscan_minlevel = unitscan_minlevel or 0
@@ -204,16 +231,28 @@ end
 
 function unitscan.load_zonetargets()
 	unitscan_zone_targets()
+	if unitscan.clear_seen_guids then
+		unitscan.clear_seen_guids()
+	end
+	if unitscan.rebuild_scan_queue then
+		unitscan.rebuild_scan_queue()
+	end
 end
 
 ------------------------------------------------------------------------------
 -- Scanning core
 --
--- Two scan strategies, chosen automatically:
---   1. Nameplate scan (MODS.ClassicAPI) — walks nameplate1..MAX_NAMEPLATES,
---      never touches your real target, works even while you have one.
---   2. Legacy TargetByName flicker-scan — identical to upstream, used as a
---      fallback when nameplate tokens aren't available.
+-- Scan strategies, chosen automatically:
+--   1. Event-driven + fast nameplate scan (MODS.ClassicAPI) — hooks
+--      NAME_PLATE_UNIT_ADDED for instant detection plus a 0.25s zero-alloc
+--      safety-net sweep over pre-allocated nameplate tokens. Never touches
+--      your real target and works even while you have one.
+--   2. Passive long-range GUID scan (MODS.Nampower / MODS.SuperWoW) — listens
+--      to unit GUID events and UNIT_CASTEVENT with a TTL cache to catch rares
+--      outside nameplate range without TargetByName or FPS drops.
+--   3. Time-sliced legacy TargetByName flicker-scan — fallback when nameplate
+--      tokens aren't available; spreads checks across frames (2 per 0.05s
+--      tick) instead of stalling a single frame with the full zone list.
 ------------------------------------------------------------------------------
 
 do
@@ -222,6 +261,61 @@ do
 	local _PlaySound = PlaySound
 	local _UIErrorsFrame_OnEvent = UIErrorsFrame_OnEvent
 	local pass = function() end
+
+	-- Passive GUID cache for Nampower/SuperWoW long-range event detection.
+	local seenGuids = {}
+	local seenGuidCount = 0
+	local SEEN_GUID_MAX = 400
+	local SEEN_GUID_TTL = 15
+
+	-- Time-sliced queue for legacy TargetByName fallback.
+	local scanQueue = {}
+	local scanQueueLen = 0
+	local scanCursor = 1
+
+	function unitscan.clear_seen_guids()
+		for k in pairs(seenGuids) do
+			seenGuids[k] = nil
+		end
+		seenGuidCount = 0
+	end
+
+	function unitscan.rebuild_scan_queue()
+		local idx = 0
+		if unitscan_targets then
+			for name in pairs(unitscan_targets) do
+				idx = idx + 1
+				local entry = scanQueue[idx]
+				if not entry then
+					entry = {}
+					scanQueue[idx] = entry
+				end
+				entry.name = name
+				entry.upper = name
+				entry.explicit = true
+			end
+		end
+		if unitscan_zonetargets then
+			for name in pairs(unitscan_zonetargets) do
+				idx = idx + 1
+				local entry = scanQueue[idx]
+				if not entry then
+					entry = {}
+					scanQueue[idx] = entry
+				end
+				entry.name = name
+				entry.upper = strupper(name)
+				entry.explicit = false
+			end
+		end
+		for i = idx + 1, scanQueueLen do
+			scanQueue[i] = nil
+		end
+		scanQueueLen = idx
+		if scanCursor > scanQueueLen then
+			scanCursor = 1
+		end
+	end
 
 	function unitscan.reset()
 		prevTarget = nil
@@ -241,10 +335,10 @@ do
 	end
 
 	-- Applies the shared filters (level, alive, attackable, optional
-	-- distance/LOS via UnitXP, optional elite suppression) to a unit token
-	-- that already matched a name. isExplicit is true for names the user
-	-- added with /unitscan directly -- those always alert regardless of the
-	-- elite filter, since the user asked for that specific mob by name.
+	-- distance/LOS via ClassicAPI/UnitXP, optional elite suppression) to a
+	-- unit token that already matched a name. isExplicit is true for names the
+	-- user added with /unitscan directly -- those always alert regardless of
+	-- the elite filter, since the user asked for that specific mob by name.
 	-- Returns true if it should trigger an alert.
 	local function passes_filters(unit, isExplicit)
 		if UnitIsPlayer(unit) then
@@ -310,26 +404,27 @@ do
 	end
 
 	-- Shared "did this already-resolved unit match either list, and if so
-	-- fire the alert" step. Used by both the polling sweep (nameplate_scan)
-	-- and the NAME_PLATE_UNIT_ADDED event handler (single-unit check) so the
-	-- alert sequence only lives in one place.
+	-- fire the alert" step. Used by nameplate_scan, NAME_PLATE_UNIT_ADDED,
+	-- and check_guid so the alert sequence only lives in one place.
 	local function evaluate_unit(unit, uname)
 		if not uname then return false end
 
-		local key = strupper(uname)
-		if unitscan_targets[key] and passes_filters(unit, true) then
-			unitscan.foundUnit = unit
-			unitscan.foundGuid = unitscan.get_guid(unit)
-			unitscan.foundTarget = key
-			unitscan.toggle_target(key)
-			unitscan.play_sound()
-			unitscan.flash.animation:Play()
-			unitscan.button:set_target()
-			apply_mark(unit)
-			return true
+		if next(unitscan_targets) ~= nil then
+			local key = strupper(uname)
+			if unitscan_targets[key] and passes_filters(unit, true) then
+				unitscan.foundUnit = unit
+				unitscan.foundGuid = unitscan.get_guid(unit)
+				unitscan.foundTarget = key
+				unitscan.toggle_target(key)
+				unitscan.play_sound()
+				unitscan.flash.animation:Play()
+				unitscan.button:set_target()
+				apply_mark(unit)
+				return true
+			end
 		end
 
-		if unitscan_zonetargets[uname] and passes_filters(unit, false) then
+		if unitscan_zonetargets and unitscan_zonetargets[uname] and passes_filters(unit, false) then
 			unitscan.foundUnit = unit
 			unitscan.foundGuid = unitscan.get_guid(unit)
 			unitscan.foundTarget = uname
@@ -346,19 +441,42 @@ do
 
 	-- Event-driven path: NAME_PLATE_UNIT_ADDED hands us one live token the
 	-- instant it appears -- check just that unit instead of waiting for the
-	-- once-a-second sweep.
+	-- polling sweep.
 	function unitscan.check_single_nameplate(unit)
 		if not (unit and UnitExists(unit)) then return end
 		evaluate_unit(unit, UnitName(unit))
 	end
 
-	-- Strategy 1: nameplate scan (polling sweep, still runs once a second as
-	-- a safety net alongside the event-driven path above -- e.g. for a plate
-	-- that existed before this addon loaded, or if an ADDED event is ever
-	-- missed). Never touches your real target.
+	-- Passive GUID path (Nampower / SuperWoW): checks a unit by GUID once per
+	-- TTL window, catching rares beyond nameplate range with near-zero CPU cost.
+	function unitscan.check_guid(guid)
+		if not guid then return end
+		local now = GetTime()
+		local seenAt = seenGuids[guid]
+		if seenAt and (now - seenAt) < SEEN_GUID_TTL then
+			return
+		end
+		if seenGuidCount >= SEEN_GUID_MAX then
+			unitscan.clear_seen_guids()
+		end
+		if not seenAt then
+			seenGuidCount = seenGuidCount + 1
+		end
+		seenGuids[guid] = now
+
+		if not UnitExists(guid) then return end
+		evaluate_unit(guid, UnitName(guid))
+	end
+
+	-- Strategy 1: nameplate scan (polling sweep running every 0.25s as a
+	-- fast safety net alongside NAME_PLATE_UNIT_ADDED). Uses pre-allocated
+	-- token strings and skips the loop when C_NamePlate reports 0 plates.
 	local function nameplate_scan()
+		if HAS_GET_NAMEPLATES and table.getn(C_NamePlate.GetNamePlates()) == 0 then
+			return
+		end
 		for i = 1, MAX_NAMEPLATES do
-			local unit = "nameplate" .. i
+			local unit = NAMEPLATE_TOKENS[i]
 			if UnitExists(unit) then
 				if evaluate_unit(unit, UnitName(unit)) then
 					return
@@ -367,9 +485,9 @@ do
 		end
 	end
 
-	-- Strategy 2: legacy flicker-scan, upstream behavior, unchanged except
-	-- for also recording a GUID when SuperWoW/nampower can supply one, and
-	-- threading isExplicit through to the elite filter.
+	-- Strategy 2: legacy flicker-scan, unchanged except for also recording a
+	-- GUID when SuperWoW/nampower can supply one, and threading isExplicit
+	-- through to the elite filter.
 	function unitscan.target(name, isExplicit)
 		prevTarget = UnitName("target")
 		UIErrorsFrame_OnEvent = pass
@@ -388,48 +506,58 @@ do
 		unitscan.foundUnit = "target"
 		unitscan.foundGuid = unitscan.get_guid("target")
 
-		if UnitIsPlayer("target") then
-			return strupper(foundTarget)
-		else
-			return strupper(foundTarget)
-		end
+		return strupper(foundTarget)
 	end
 
 	function unitscan.check_for_targets()
 		if MODS.ClassicAPI then
 			-- Nameplate path: doesn't require an empty target, doesn't touch
 			-- your real target, so we don't early-return on UnitExists("target").
-			-- This is now just the once-a-second safety-net sweep; most hits
-			-- will already have fired instantly via NAME_PLATE_UNIT_ADDED.
 			nameplate_scan()
 			return
 		end
 
-		-- Legacy path: identical to upstream, requires no current target.
-		if UnitExists("target") then
+		-- Time-sliced legacy path: requires no current target, checks at most
+		-- LEGACY_BATCH_SIZE targets per tick so FPS stays smooth.
+		if UnitExists("target") or scanQueueLen == 0 then
 			return
 		end
 
-		for name, _ in unitscan_targets do
-			if name == unitscan.target(name, true) then
-				unitscan.foundTarget = name
-				unitscan.toggle_target(name)
-				unitscan.play_sound()
-				unitscan.flash.animation:Play()
-				unitscan.button:set_target()
-			end
-			unitscan.restoreTarget()
+		local count = LEGACY_BATCH_SIZE
+		if count > scanQueueLen then
+			count = scanQueueLen
 		end
 
-		for name, _ in unitscan_zonetargets do
-			if strupper(name) == unitscan.target(name, false) then
-				unitscan.foundTarget = name
-				unitscan.toggle_zonetarget(name)
-				unitscan.play_sound()
-				unitscan.flash.animation:Play()
-				unitscan.button:set_target()
+		for i = 1, count do
+			local entry = scanQueue[scanCursor]
+			scanCursor = scanCursor + 1
+			if scanCursor > scanQueueLen then
+				scanCursor = 1
 			end
-			unitscan.restoreTarget()
+			if entry then
+				if entry.explicit then
+					if entry.name == unitscan.target(entry.name, true) then
+						unitscan.foundTarget = entry.name
+						unitscan.toggle_target(entry.name)
+						unitscan.play_sound()
+						unitscan.flash.animation:Play()
+						unitscan.button:set_target()
+						unitscan.restoreTarget()
+						return
+					end
+				else
+					if entry.upper == unitscan.target(entry.name, false) then
+						unitscan.foundTarget = entry.name
+						unitscan.toggle_zonetarget(entry.name)
+						unitscan.play_sound()
+						unitscan.flash.animation:Play()
+						unitscan.button:set_target()
+						unitscan.restoreTarget()
+						return
+					end
+				end
+				unitscan.restoreTarget()
+			end
 		end
 	end
 end
@@ -693,14 +821,19 @@ function unitscan.LOAD()
 		end
 	end
 
+	unitscan.rebuild_scan_queue()
+
 	unitscan.print(string.format(
 		"mods detected: ClassicAPI=%s SuperWoW=%s nampower=%s UnitXP_SP3=%s VanillaHelpers=%s",
 		tostring(MODS.ClassicAPI), tostring(MODS.SuperWoW), tostring(MODS.Nampower),
 		tostring(MODS.UnitXP), tostring(MODS.VanillaHelpers)))
 	if MODS.ClassicAPI then
-		unitscan.print("using nameplate scan (no target flicker)")
+		unitscan.print("using nameplate scan (0.25s) + instant NAME_PLATE_UNIT_ADDED")
 	else
-		unitscan.print("using legacy TargetByName scan (install ClassicAPI to remove target flicker)")
+		unitscan.print("using time-sliced TargetByName scan (install ClassicAPI to remove target flicker)")
+	end
+	if MODS.Nampower or MODS.SuperWoW then
+		unitscan.print("passive long-range GUID scan enabled")
 	end
 end
 
@@ -712,16 +845,18 @@ do
 	unitscan.last_check = GetTime()
 	function unitscan.UPDATE()
 		if unitscan.scan then
+			local now = GetTime()
 			if unitscan.button and unitscan.button:IsShown() and unitscan.button.autoCloseTime then
-				if GetTime() >= unitscan.button.autoCloseTime then
+				if now >= unitscan.button.autoCloseTime then
 					unitscan.button:Hide()
 					unitscan.button.autoCloseTime = nil
 				end
 			end
 
-			if GetTime() - unitscan.last_check >= CHECK_INTERVAL then
-				unitscan.last_check = GetTime()
-				if (unitscan.reloadtimer and (unitscan.last_check >= unitscan.reloadtimer)) then
+			local interval = MODS.ClassicAPI and CHECK_INTERVAL or LEGACY_TICK_INTERVAL
+			if now - unitscan.last_check >= interval then
+				unitscan.last_check = now
+				if (unitscan.reloadtimer and (now >= unitscan.reloadtimer)) then
 					unitscan.reloadtimer = nil
 					unitscan.load_zonetargets()
 				end
@@ -764,9 +899,11 @@ function unitscan.toggle_target(name)
 	if unitscan_targets[key] then
 		unitscan_targets[key] = nil
 		unitscan.print('- ' .. key)
+		unitscan.rebuild_scan_queue()
 	elseif key ~= '' then
 		unitscan_targets[key] = true
 		unitscan.print('+ ' .. key)
+		unitscan.rebuild_scan_queue()
 	end
 end
 
@@ -776,6 +913,7 @@ function unitscan.toggle_zonetarget(name)
 		unitscan.print(key .. ' was found!')
 		unitscan_zonetargets[key] = nil
 		unitscan.reloadtimer = GetTime() + 90
+		unitscan.rebuild_scan_queue()
 	end
 end
 
@@ -918,12 +1056,16 @@ SLASH_UNITSCANMODS1 = "/unitscanmods"
 function SlashCmdList.UNITSCANMODS(msg)
 	unitscan.print("===== Detected mods =====")
 	unitscan.print("ClassicAPI (nameplate scan, instant NAME_PLATE_UNIT_ADDED, native range/LOS): " .. tostring(MODS.ClassicAPI))
-	unitscan.print("SuperWoW (GUIDs, mark1-8): " .. tostring(MODS.SuperWoW))
-	unitscan.print("nampower (GUIDs, UNIT_DIED): " .. tostring(MODS.Nampower))
+	unitscan.print("SuperWoW (GUIDs, mark1-8, UNIT_CASTEVENT long-range scan): " .. tostring(MODS.SuperWoW))
+	unitscan.print("nampower (GUIDs, UNIT_DIED, UNIT_*_GUID long-range scan): " .. tostring(MODS.Nampower))
 	unitscan.print("UnitXP_SP3 (range/LOS fallback, taskbar/sound alert): " .. tostring(MODS.UnitXP))
 	unitscan.print("VanillaHelpers (minimap blip on found unit): " .. tostring(MODS.VanillaHelpers))
 	unitscan.print("Native TargetUnit/SetRaidTarget available: " .. tostring(CAN_TARGETUNIT) .. " / " .. tostring(CAN_MARK))
-	unitscan.print("Scan method in use: " .. (MODS.ClassicAPI and "event-driven nameplate scan" or "legacy TargetByName flicker-scan"))
+	local method = MODS.ClassicAPI and "event-driven + 0.25s nameplate scan" or "time-sliced TargetByName scan"
+	if MODS.Nampower or MODS.SuperWoW then
+		method = method .. " + passive GUID scan"
+	end
+	unitscan.print("Scan method in use: " .. method)
 end
 
 SLASH_UNITSCANHELP1 = "/unitscanhelp"
