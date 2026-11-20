@@ -61,37 +61,46 @@ local unitscan = CreateFrame'Frame'
 ------------------------------------------------------------------------------
 
 local MODS = {}
+local GetGUID
+local CAN_TARGETUNIT
+local CAN_MARK
+local CAN_NATIVE_DIST
+local CAN_NATIVE_LOS
 
--- SuperWoW sets these globals per its own documented feature list.
-MODS.SuperWoW = (SUPERWOW_VERSION ~= nil) or (SUPERWOW_STRING ~= nil)
+local function detect_mods()
+	-- SuperWoW sets these globals per its own documented feature list.
+	MODS.SuperWoW = (SUPERWOW_VERSION ~= nil) or (SUPERWOW_STRING ~= nil)
 
--- nampower's GUID getter has been named both UnitGUID and GetUnitGUID across
--- versions (its own changelog shows the migration) — check both.
-local GetGUID = UnitGUID or GetUnitGUID
-MODS.Nampower = (type(GetNampowerVersion) == 'function') or (GetGUID ~= nil) or (type(GetCVar) == 'function' and GetCVar('NP_SpellQueueWindowMs') ~= nil)
+	-- nampower's GUID getter has been named both UnitGUID and GetUnitGUID across
+	-- versions (its own changelog shows the migration) — check both.
+	GetGUID = UnitGUID or GetUnitGUID
+	MODS.Nampower = (type(GetNampowerVersion) == 'function') or (GetGUID ~= nil) or (type(GetCVar) == 'function' and GetCVar('NP_SpellQueueWindowMs') ~= nil)
 
--- UnitXP_SP3's own documented existence check.
-MODS.UnitXP = (type(UnitXP) == 'function') and pcall(UnitXP, 'nop', 'nop')
+	-- UnitXP_SP3's own documented existence check.
+	MODS.UnitXP = (type(UnitXP) == 'function') and pcall(UnitXP, 'nop', 'nop')
 
--- ClassicAPI: check CLASSIC_API_VERSION, C_NamePlate, or nameplate1 token.
-MODS.ClassicAPI = (CLASSIC_API_VERSION ~= nil) or (C_NamePlate ~= nil) or (type(UnitExists) == 'function' and (function()
-	local ok = pcall(UnitExists, 'nameplate1')
-	return ok
-end)())
+	-- ClassicAPI: check CLASSIC_API_VERSION, C_NamePlate, or nameplate1 token.
+	MODS.ClassicAPI = (CLASSIC_API_VERSION ~= nil) or (C_NamePlate ~= nil) or (type(UnitExists) == 'function' and (function()
+		local ok = pcall(UnitExists, 'nameplate1')
+		return ok
+	end)())
 
-MODS.VanillaHelpers = (type(SetUnitBlip) == 'function')
+	MODS.VanillaHelpers = (type(SetUnitBlip) == 'function')
 
--- Confirmed native to the base 1.12.1 client (not added by any of the above) —
--- still feature-detected defensively since we can't be 100% sure of every
--- client build, but no longer treated as an uncertain "maybe modern API" call.
-local CAN_TARGETUNIT = (type(TargetUnit) == 'function')
-local CAN_MARK = (type(SetRaidTarget) == 'function')
+	CAN_TARGETUNIT = (type(TargetUnit) == 'function')
+	CAN_MARK = (type(SetRaidTarget) == 'function')
+	CAN_NATIVE_DIST = (type(UnitDistanceSquared) == 'function')
+	CAN_NATIVE_LOS = (type(UnitInLineOfSight) == 'function')
 
--- ClassicAPI's native distance/LOS backport. When present this needs nothing
--- else -- UnitXP_SP3 is only consulted as a fallback for people who have
--- UnitXP but not ClassicAPI.
-local CAN_NATIVE_DIST = (type(UnitDistanceSquared) == 'function')
-local CAN_NATIVE_LOS = (type(UnitInLineOfSight) == 'function')
+	if MODS.Nampower then
+		unitscan:RegisterEvent'UNIT_DIED'
+	end
+	if MODS.ClassicAPI then
+		unitscan:RegisterEvent'NAME_PLATE_UNIT_ADDED'
+	end
+end
+
+detect_mods()
 
 -- Unified GUID getter that works whichever of SuperWoW/nampower is present.
 function unitscan.get_guid(unit)
@@ -113,9 +122,12 @@ end
 unitscan:SetScript('OnUpdate', function() unitscan.UPDATE() end)
 unitscan:SetScript('OnEvent', function()
 	if event == "VARIABLES_LOADED" then
+		detect_mods()
 		unitscan.LOAD()
 		unitscan.scan = true
 		unitscan.last_check = 0
+	elseif event == "PLAYER_LOGIN" then
+		detect_mods()
 	elseif event == "PLAYER_REGEN_DISABLED" then
 		unitscan.incombat = true
 		unitscan.scan = nil
@@ -158,6 +170,7 @@ unitscan:SetScript('OnEvent', function()
 	end
 end)
 unitscan:RegisterEvent'VARIABLES_LOADED'
+unitscan:RegisterEvent'PLAYER_LOGIN'
 unitscan:RegisterEvent'MINIMAP_ZONE_CHANGED'
 unitscan:RegisterEvent'PLAYER_ENTERING_WORLD'
 unitscan:RegisterEvent'PLAYER_REGEN_DISABLED'
@@ -418,13 +431,21 @@ do
 		if next(unitscan_targets) == nil and (not unitscan_zonetargets or next(unitscan_zonetargets) == nil) then
 			return
 		end
+		local active = 0
 		for i = 1, MAX_NAMEPLATES do
 			local unit = NAMEPLATE_TOKENS[i]
 			if UnitExists(unit) then
+				active = active + 1
 				if evaluate_unit(unit, UnitName(unit)) then
+					if unitscan.trace then
+						unitscan.print(string.format("[trace %.2f] nameplate_scan matched %s", GetTime(), unit))
+					end
 					return
 				end
 			end
+		end
+		if unitscan.trace and active > 0 then
+			unitscan.print(string.format("[trace %.2f] nameplate_scan checked %d plates", GetTime(), active))
 		end
 	end
 
@@ -432,6 +453,9 @@ do
 	-- GUID when SuperWoW/nampower can supply one, and threading isExplicit
 	-- through to the elite filter.
 	function unitscan.target(name, isExplicit)
+		if unitscan.trace then
+			unitscan.print(string.format("[trace %.2f] TargetByName(%s)", GetTime(), tostring(name)))
+		end
 		prevTarget = UnitName("target")
 		UIErrorsFrame_OnEvent = pass
 		PlaySound = pass
@@ -1007,6 +1031,12 @@ function SlashCmdList.UNITSCANMODS(msg)
 	unitscan.print("VanillaHelpers (minimap blip on found unit): " .. tostring(MODS.VanillaHelpers))
 	unitscan.print("Native TargetUnit/SetRaidTarget available: " .. tostring(CAN_TARGETUNIT) .. " / " .. tostring(CAN_MARK))
 	unitscan.print("Scan method in use: " .. (MODS.ClassicAPI and "event-driven + zero-alloc nameplate scan" or "time-sliced TargetByName scan"))
+end
+
+SLASH_UNITSCANTRACE1 = "/unitscantrace"
+function SlashCmdList.UNITSCANTRACE(msg)
+	unitscan.trace = not unitscan.trace
+	unitscan.print("Debug trace: " .. (unitscan.trace and "ON" or "OFF"))
 end
 
 SLASH_UNITSCANHELP1 = "/unitscanhelp"
