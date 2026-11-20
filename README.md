@@ -4,108 +4,89 @@ A fork of [unitscan-soft](https://github.com/gttnvk/unitscan-soft) — a 1.12
 vanilla/Turtle WoW addon that alerts you when a tracked NPC (a specific name
 you add, or a curated zone list of rares/dangerous elites) spawns nearby.
 
-This fork adds **optional** integrations with five popular 1.12 client mods.
-None of them are required — with nothing installed, this addon behaves
-exactly like upstream. Each integration is feature-detected at load time, so
-it's safe to run with any subset of these installed.
+## Required / Optional DLL Mods
+
+None of these DLL mods are required — with nothing installed, the addon falls
+back gracefully to pure Lua 5.0 / 1.12.1 APIs. All integrations below are
+feature-detected at load time and at `PLAYER_LOGIN`.
+
+| Mod | Role | What it adds here |
+|---|---|---|
+| [ClassicAPI](https://github.com/brues-code/ClassicAPI) | Optional | `nameplate1..nameplateN` unit tokens (scan without touching your target), `NAME_PLATE_UNIT_ADDED` event (instant detection), native `UnitDistanceSquared` / `UnitInLineOfSight` (range/LOS filtering) |
+| [SuperWoW](https://github.com/balakethelock/SuperWoW) | Optional | `UnitExists()` returns a GUID as its 2nd value — used as a GUID source |
+| [nampower](https://github.com/brues-code/nampower) | Optional | `GetUnitGUID` / `UnitGUID` — alternate GUID source; `UNIT_DIED` event — instantly drops a found zone-target instead of waiting on the reload timer |
+| [UnitXP_SP3](https://codeberg.org/konaka/UnitXP_SP3) | Optional | Fallback range/LOS source when ClassicAPI is absent; `UnitXP("notify", "taskbarIcon" / "systemSound")` for background alerts while tabbed out |
+| [VanillaHelpers](https://github.com/isfir/VanillaHelpers) | Optional | `SetUnitBlip` — custom minimap marker on whatever was just found |
+
+Also uses `TargetUnit(unit)` and `SetRaidTarget(unit, index)`, which are native
+to the base 1.12.1 client, for unambiguous retargeting and optional skull
+marking.
 
 ## Why fork it
 
 The original addon finds NPCs by calling `TargetByName(name, true)` on a
 timer: it briefly switches your actual target to check for a name match, then
-switches back. That's a real target change — other addons see a
-`PLAYER_TARGET_CHANGED` event for it, and the scan has to stay dormant
-whenever you already have something targeted, since it can't safely check
-names without touching your target.
+switches back. That creates spurious `PLAYER_TARGET_CHANGED` events, pauses
+whenever you already have a target, and can stutter FPS in zones with large
+target lists.
 
 With [ClassicAPI](https://github.com/brues-code/ClassicAPI) installed, this
 fork scans nameplate unit tokens instead: your real target is never touched,
-the scan works even while you already have a target, and detection is
-event-driven instead of polled once a second.
-
-## Mods this integrates with (all optional)
-
-| Mod | What it adds here |
-|---|---|
-| [ClassicAPI](https://github.com/brues-code/ClassicAPI) | `nameplate1..nameplateN` unit tokens (scan without touching your target), `NAME_PLATE_UNIT_ADDED` event (instant detection instead of polling), native `UnitDistanceSquared`/`UnitInLineOfSight` (range/LOS filtering) |
-| [SuperWoW](https://github.com/balakethelock/SuperWoW) | `UnitExists()` returns a GUID as its 2nd value — used as a GUID source |
-| [nampower](https://github.com/brues-code/nampower) | `GetUnitGUID`/`UnitGUID` — alternate GUID source; `UNIT_DIED` event — instantly drops a found zone-target instead of waiting on the reload timer |
-| [UnitXP_SP3](https://codeberg.org/konaka/UnitXP_SP3) | Fallback range/LOS source if you have UnitXP but not ClassicAPI; `notify("taskbarIcon"/"systemSound")` for background alerts while tabbed out (no ClassicAPI equivalent for this one) |
-| [VanillaHelpers](https://github.com/isfir/VanillaHelpers) | `SetUnitBlip` — custom minimap marker on whatever was just found |
-
-Also uses `TargetUnit(unit)`, which is native to the base 1.12.1 client (not
-added by any mod above) for reliable retargeting by GUID or live unit token.
+the scan works even while you have a target, and detection is event-driven.
 
 ## What's new / improved vs. upstream
 
-- **No more target flicker.** With ClassicAPI, scanning walks nameplate
-  tokens instead of hijacking `target` every second. Other addons never see
-  a spurious target change from this addon.
-- **Works while you already have a target.** Upstream refuses to scan at all
-  if `UnitExists("target")`. The nameplate path has no such restriction.
-- **Event-driven, near-instant detection.** Hooks `NAME_PLATE_UNIT_ADDED` so
-  a match fires within a tick of the nameplate appearing, instead of waiting
-  up to 1 second for the next poll. The 1-second poll still runs as a
-  safety net (e.g. for plates that existed before the addon loaded).
-- **GUID-aware.** Captures a GUID for whatever's found (via SuperWoW,
-  nampower, or ClassicAPI's resolver) so retargeting and death-tracking are
-  unambiguous even with duplicate-named mobs nearby.
-- **Reliable retarget.** `/unitscantarget` now targets the live unit token or
-  GUID directly via `TargetUnit` instead of `TargetByName(name)`, which can
-  grab the wrong mob when two share a name. Falls back to the old
-  name-based method if no live token/GUID is available.
-- **Native range filter — `/unitscanrange <yards>`.** Only alert within a
-  given distance. Uses ClassicAPI's native `UnitDistanceSquared` if present,
-  falls back to UnitXP_SP3's `distanceBetween` otherwise.
-- **Native line-of-sight filter — `/unitscanlos on|off`.** Same
-  native-then-UnitXP-fallback pattern, using `UnitInLineOfSight`.
-- **Elite noise control — `/unitscanelite on|off`.** Suppresses alerts for
-  plain `"elite"`-classified mobs from the auto-populated zone list (useful
-  in elite-dense open-world zones). Rares, rare-elites, and world bosses are
-  never suppressed by this. Anything you added yourself with `/unitscan
-  <name>` always alerts regardless of this setting — you asked for that one
-  specifically.
-- **Minimum level filter — `/unitscanlevel <number>`.** Only alert for mobs
-  at or above a given level.
-- **Instant death cleanup.** With nampower's `UNIT_DIED` event, a found
-  zone-target is dropped the moment it dies instead of waiting on the
-  90-second reload timer.
-- **Background alerts.** With UnitXP_SP3, a found target also flashes your
-  taskbar and plays an OS-level sound, so you notice even if the game window
-  isn't focused.
-- **Minimap blip.** With VanillaHelpers, drops a distinct marker on the
-  minimap for whatever was just found.
-- **`/unitscanmods`** — new command, prints exactly which of the five mods
-  were detected and which scan strategy (event-driven nameplate scan vs.
-  legacy flicker-scan) is currently active. Useful for confirming your
-  install is actually being picked up.
-- **`/unitscanhelp`** — new command, full in-game command reference.
-- **Graceful degrade, always.** Every integration above is feature-detected
-  independently. With zero of these mods installed, behavior is identical to
-  upstream unitscan-soft.
+- **Auto-pause in raid instances (zero raid FPS overhead).** Automatically
+  pauses scanning (`OnUpdate` script detached, `NAME_PLATE_UNIT_ADDED`
+  unregistered) when entering a raid instance via `IsInInstance()`, and
+  automatically resumes when leaving the raid instance (unless manually
+  disabled).
+- **Manual on/off toggle — `/unitscantoggle [on|off]`.** Manually turn the
+  scanner on or off at any time (persisted across reloads). Turning it `on`
+  inside a raid instance temporarily overrides the raid auto-pause for that
+  raid.
+- **Zero-allocation, faster nameplate scan.** Uses pre-allocated
+  `nameplate1..40` token strings, skips `strupper()` when no custom
+  `/unitscan` targets are set, and skips the loop when both target lists are
+  empty. Polling safety-net runs every `0.5s` in open-world (`1.0s` in 5-man
+  dungeons) alongside instant `NAME_PLATE_UNIT_ADDED` detection.
+- **Time-sliced legacy fallback.** When ClassicAPI is not installed,
+  `TargetByName` checks are spread across frames (`2` targets per `0.05s`
+  tick) instead of scanning the entire zone list in a single frame.
+- **No target flicker & works while targeting.** With ClassicAPI, scanning
+  never touches `target`.
+- **GUID-aware & reliable retargeting.** Captures GUIDs via nampower or
+  SuperWoW so `/unitscantarget` targets the exact mob via `TargetUnit`.
+- **Native range & line-of-sight filters.** `/unitscanrange <yards>` and
+  `/unitscanlos on|off` using ClassicAPI native APIs (with UnitXP_SP3
+  fallback).
+- **Elite noise control & minimum level filter.** `/unitscanelite on|off`
+  suppresses plain `"elite"` hits from the zone list while keeping rares,
+  rare-elites, world bosses, and explicit `/unitscan <name>` targets;
+  `/unitscanlevel <number>` filters by minimum level.
+- **Instant death cleanup & background alerts.** `UNIT_DIED` (nampower) clears
+  dead targets immediately; `UnitXP_SP3` flashes the taskbar/plays an OS sound
+  when tabbed out; `VanillaHelpers` drops a minimap blip; `/unitscanmark`
+  places a skull raid mark.
+- **Diagnostics.** `/unitscanmods` shows detected mods and active scan mode;
+  `/unitscantrace` toggles timestamped trace logging.
 
 ## Slash commands
 
 | Command | Description |
 |---|---|
+| `/unitscantoggle [on\|off]` | Manually turn scanner on/off (persisted; `on` overrides raid auto-pause for current raid) |
 | `/unitscan <name>` | Toggle tracking of a specific NPC by name |
 | `/unitscanlevel <number>` | Only alert for mobs at or above this level (0 = all) |
 | `/unitscanwf <seconds>` | Auto-close time for the popup window (0 = manual close) |
-| `/unitscanrange <yards>` | Only alert within this range (0 = unlimited). Native via ClassicAPI, or UnitXP_SP3 fallback |
-| `/unitscanlos on\|off` | Also require line of sight to alert. Native via ClassicAPI, or UnitXP_SP3 fallback |
-| `/unitscanelite on\|off` | Suppress plain "elite" hits from the zone-target list |
+| `/unitscanrange <yards>` | Only alert within this range (0 = unlimited; ClassicAPI or UnitXP_SP3) |
+| `/unitscanlos on\|off` | Also require line of sight to alert (ClassicAPI or UnitXP_SP3) |
+| `/unitscanmark on\|off` | Drop a skull raid-mark on whatever is found |
+| `/unitscanelite on\|off` | Suppress plain `"elite"` hits from the zone-target list |
 | `/unitscantarget` | Retarget the last detected NPC |
 | `/unitscanmods` | Show which optional mods were detected and which scan method is active |
+| `/unitscantrace` | Toggle debug trace logging |
 | `/unitscanhelp` | Show the full in-game command reference |
-
-## Installation
-
-1. Drop this repo's contents into `Interface/AddOns/unitscan-turtle-hc/`
-   (same folder name/structure as upstream — this is a drop-in replacement
-   for `unitscan.lua` only; `zonetargets.lua` and the `.toc` are unchanged).
-2. Any subset of ClassicAPI, SuperWoW, nampower, UnitXP_SP3, and
-   VanillaHelpers can be installed alongside it — none are required.
-3. In-game, run `/unitscanmods` to confirm what was detected.
 
 ## Credits
 

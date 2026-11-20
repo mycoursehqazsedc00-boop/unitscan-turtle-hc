@@ -116,34 +116,90 @@ function unitscan.get_guid(unit)
 end
 
 ------------------------------------------------------------------------------
--- Frame setup / events (unchanged from upstream, plus UNIT_DIED if present)
+-- Frame setup / events / raid auto-pause state
 ------------------------------------------------------------------------------
 
-unitscan:SetScript('OnUpdate', function() unitscan.UPDATE() end)
-unitscan:SetScript('OnEvent', function()
-	if event == "VARIABLES_LOADED" then
-		detect_mods()
-		unitscan.LOAD()
-		unitscan.scan = true
-		unitscan.last_check = 0
-	elseif event == "PLAYER_LOGIN" then
-		detect_mods()
-	elseif event == "PLAYER_REGEN_DISABLED" then
-		unitscan.incombat = true
-		unitscan.scan = nil
-	elseif event == "PLAYER_REGEN_ENABLED" then
-		unitscan.incombat = nil
-		unitscan.scan = true
-		unitscan.last_check = 0
-	elseif (event == "PLAYER_ENTER_COMBAT" or event == "START_AUTOREPEAT_SPELL") then
-		if not unitscan.incombat then
-			unitscan.scan = nil
-		end
-	elseif (event == "STOP_AUTOREPEAT_SPELL" or event == "PLAYER_LEAVE_COMBAT") then
-		if not unitscan.incombat then
+local on_update = function() unitscan.UPDATE() end
+
+function unitscan.refresh_scan_state()
+	local enabled = (unitscan_enabled ~= 0)
+	local allowedInZone = (not unitscan.inRaidInstance) or unitscan.raidBypass
+	local active = enabled and allowedInZone and (not unitscan.incombat) and (not unitscan.inAutoCombat)
+
+	if active then
+		if not unitscan.scan then
 			unitscan.scan = true
 			unitscan.last_check = 0
 		end
+		unitscan:SetScript('OnUpdate', on_update)
+		if MODS.ClassicAPI then
+			unitscan:RegisterEvent'NAME_PLATE_UNIT_ADDED'
+		end
+	else
+		unitscan.scan = nil
+		unitscan:SetScript('OnUpdate', nil)
+		if MODS.ClassicAPI then
+			unitscan:UnregisterEvent'NAME_PLATE_UNIT_ADDED'
+		end
+	end
+
+	if unitscan.trace then
+		unitscan.print(string.format(
+			"[trace %.2f] state scan=%s enabled=%s inRaid=%s bypass=%s combat=%s",
+			GetTime(), tostring(unitscan.scan ~= nil), tostring(enabled),
+			tostring(unitscan.inRaidInstance == true), tostring(unitscan.raidBypass == true),
+			tostring(unitscan.incombat == true or unitscan.inAutoCombat == true)))
+	end
+end
+
+function unitscan.update_instance_state()
+	local inInstance, instanceType
+	if type(IsInInstance) == 'function' then
+		inInstance, instanceType = IsInInstance()
+	end
+	unitscan.inInstance = (inInstance and true) or false
+	local wasInRaid = unitscan.inRaidInstance
+	local nowInRaid = (inInstance and instanceType == "raid") and true or false
+	unitscan.inRaidInstance = nowInRaid
+
+	if nowInRaid and not wasInRaid then
+		unitscan.raidBypass = nil
+		if unitscan_enabled ~= 0 then
+			unitscan.print("Auto-paused inside raid instance (/unitscantoggle on to override).")
+		end
+	elseif (not nowInRaid) and wasInRaid then
+		unitscan.raidBypass = nil
+		if unitscan_enabled ~= 0 then
+			unitscan.print("Resumed outside raid instance.")
+		end
+	end
+
+	unitscan.refresh_scan_state()
+end
+
+unitscan:SetScript('OnEvent', function()
+	if event == "VARIABLES_LOADED" then
+		detect_mods()
+		if unitscan_enabled == nil then
+			unitscan_enabled = 1
+		end
+		unitscan.LOAD()
+		unitscan.update_instance_state()
+	elseif event == "PLAYER_LOGIN" then
+		detect_mods()
+		unitscan.update_instance_state()
+	elseif event == "PLAYER_REGEN_DISABLED" then
+		unitscan.incombat = true
+		unitscan.refresh_scan_state()
+	elseif event == "PLAYER_REGEN_ENABLED" then
+		unitscan.incombat = nil
+		unitscan.refresh_scan_state()
+	elseif (event == "PLAYER_ENTER_COMBAT" or event == "START_AUTOREPEAT_SPELL") then
+		unitscan.inAutoCombat = true
+		unitscan.refresh_scan_state()
+	elseif (event == "STOP_AUTOREPEAT_SPELL" or event == "PLAYER_LEAVE_COMBAT") then
+		unitscan.inAutoCombat = nil
+		unitscan.refresh_scan_state()
 	elseif event == "UNIT_DIED" then
 		-- nampower-only event. arg1 is a GUID; if it matches the unit we're
 		-- currently tracking as "found", drop it immediately rather than
@@ -162,10 +218,13 @@ unitscan:SetScript('OnEvent', function()
 		-- check just that one unit immediately instead of waiting for the
 		-- polling sweep in unitscan.UPDATE.
 		if unitscan.scan then
+			if unitscan.trace then
+				unitscan.print(string.format("[trace %.2f] NAME_PLATE_UNIT_ADDED %s", GetTime(), tostring(arg1)))
+			end
 			unitscan.check_single_nameplate(arg1)
 		end
 	else
-		unitscan.inInstance = (type(IsInInstance) == 'function') and IsInInstance() or false
+		unitscan.update_instance_state()
 		unitscan.load_zonetargets()
 	end
 end)
@@ -189,7 +248,7 @@ end
 local BROWN = {.7, .15, .05}
 local YELLOW = {1, 1, .15}
 local CHECK_INTERVAL = 0.5 -- open-world nameplate safety-net sweep (zero GC alloc)
-local INSTANCE_CHECK_INTERVAL = 1.0 -- relaxed interval inside dungeons/raids for max FPS
+local INSTANCE_CHECK_INTERVAL = 1.0 -- relaxed interval inside 5-man dungeons
 local LEGACY_TICK_INTERVAL = 0.05 -- time-sliced legacy scan tick
 local LEGACY_BATCH_SIZE = 2 -- max TargetByName calls per legacy tick to prevent FPS spikes
 local MAX_NAMEPLATES = 40 -- loop bound for nameplate1..N
@@ -199,6 +258,7 @@ for i = 1, MAX_NAMEPLATES do
 end
 
 unitscan_targets = {}
+unitscan_enabled = unitscan_enabled or 1 -- 1 = enabled, 0 = manually disabled via /unitscantoggle
 unitscan_minlevel = unitscan_minlevel or 0
 unitscan_wf = unitscan_wf or 0
 unitscan_range = unitscan_range or 0 -- 0 = no distance filter (ClassicAPI native, UnitXP fallback)
@@ -1033,6 +1093,41 @@ function SlashCmdList.UNITSCANMODS(msg)
 	unitscan.print("Scan method in use: " .. (MODS.ClassicAPI and "event-driven + zero-alloc nameplate scan" or "time-sliced TargetByName scan"))
 end
 
+SLASH_UNITSCANTOGGLE1 = "/unitscantoggle"
+function SlashCmdList.UNITSCANTOGGLE(msg)
+	local _, _, arg = strfind(strlower(msg or ''), '^%s*(.-)%s*$')
+	if arg == 'on' then
+		unitscan_enabled = 1
+		if unitscan.inRaidInstance then
+			unitscan.raidBypass = true
+		end
+	elseif arg == 'off' then
+		unitscan_enabled = 0
+		unitscan.raidBypass = nil
+	elseif arg == '' then
+		if unitscan_enabled ~= 0 and ((not unitscan.inRaidInstance) or unitscan.raidBypass) then
+			unitscan_enabled = 0
+			unitscan.raidBypass = nil
+		else
+			unitscan_enabled = 1
+			if unitscan.inRaidInstance then
+				unitscan.raidBypass = true
+			end
+		end
+	else
+		unitscan.print("Use /unitscantoggle [on|off].")
+		return
+	end
+	unitscan.refresh_scan_state()
+	if unitscan_enabled == 0 then
+		unitscan.print("Scanner manually turned OFF.")
+	elseif unitscan.inRaidInstance and unitscan.raidBypass then
+		unitscan.print("Scanner manually turned ON (raid auto-pause overridden for this raid).")
+	else
+		unitscan.print("Scanner turned ON.")
+	end
+end
+
 SLASH_UNITSCANTRACE1 = "/unitscantrace"
 function SlashCmdList.UNITSCANTRACE(msg)
 	unitscan.trace = not unitscan.trace
@@ -1042,6 +1137,9 @@ end
 SLASH_UNITSCANHELP1 = "/unitscanhelp"
 function SlashCmdList.UNITSCANHELP(msg)
 	unitscan.print("===== Unitscan Help =====")
+	unitscan.print("/unitscantoggle [on|off]")
+	unitscan.print("  Manually turn scanner on or off (auto-pauses inside raid instances).")
+	unitscan.print("  Current: " .. (unitscan_enabled == 0 and "OFF (manual)" or (unitscan.inRaidInstance and not unitscan.raidBypass and "PAUSED (raid)" or "ON")))
 	unitscan.print("/unitscan <name>")
 	unitscan.print("  Toggle tracking of a specific NPC by name.")
 	unitscan.print("  Example: /unitscan Hogger")
