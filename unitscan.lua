@@ -152,18 +152,8 @@ unitscan:SetScript('OnEvent', function()
 		if unitscan.scan then
 			unitscan.check_single_nameplate(arg1)
 		end
-	elseif event == "UNIT_NAME_UPDATE_GUID" or event == "UNIT_HEALTH_GUID" or event == "UNIT_AURA_GUID" or event == "UNIT_COMBAT_GUID" then
-		-- nampower GUID events: passive long-range detection without TargetByName.
-		-- Skip player (arg2 == 1) and player pet (arg5 == 1).
-		if unitscan.scan and arg1 and arg2 ~= 1 and arg5 ~= 1 then
-			unitscan.check_guid(arg1)
-		end
-	elseif event == "UNIT_CASTEVENT" then
-		-- SuperWoW event: arg1 is casterGUID; passive long-range detection.
-		if unitscan.scan and arg1 then
-			unitscan.check_guid(arg1)
-		end
 	else
+		unitscan.inInstance = (type(IsInInstance) == 'function') and IsInInstance() or false
 		unitscan.load_zonetargets()
 	end
 end)
@@ -178,13 +168,6 @@ unitscan:RegisterEvent'START_AUTOREPEAT_SPELL'
 unitscan:RegisterEvent'STOP_AUTOREPEAT_SPELL'
 if MODS.Nampower then
 	unitscan:RegisterEvent'UNIT_DIED'
-	unitscan:RegisterEvent'UNIT_NAME_UPDATE_GUID'
-	unitscan:RegisterEvent'UNIT_HEALTH_GUID'
-	unitscan:RegisterEvent'UNIT_AURA_GUID'
-	unitscan:RegisterEvent'UNIT_COMBAT_GUID'
-end
-if MODS.SuperWoW then
-	unitscan:RegisterEvent'UNIT_CASTEVENT'
 end
 if MODS.ClassicAPI then
 	unitscan:RegisterEvent'NAME_PLATE_UNIT_ADDED'
@@ -192,7 +175,8 @@ end
 
 local BROWN = {.7, .15, .05}
 local YELLOW = {1, 1, .15}
-local CHECK_INTERVAL = 0.25 -- faster nameplate safety-net sweep (zero GC alloc)
+local CHECK_INTERVAL = 0.5 -- open-world nameplate safety-net sweep (zero GC alloc)
+local INSTANCE_CHECK_INTERVAL = 1.0 -- relaxed interval inside dungeons/raids for max FPS
 local LEGACY_TICK_INTERVAL = 0.05 -- time-sliced legacy scan tick
 local LEGACY_BATCH_SIZE = 2 -- max TargetByName calls per legacy tick to prevent FPS spikes
 local MAX_NAMEPLATES = 40 -- loop bound for nameplate1..N
@@ -200,7 +184,6 @@ local NAMEPLATE_TOKENS = {}
 for i = 1, MAX_NAMEPLATES do
 	NAMEPLATE_TOKENS[i] = "nameplate" .. i
 end
-local HAS_GET_NAMEPLATES = (C_NamePlate ~= nil and type(C_NamePlate.GetNamePlates) == 'function')
 
 unitscan_targets = {}
 unitscan_minlevel = unitscan_minlevel or 0
@@ -231,9 +214,6 @@ end
 
 function unitscan.load_zonetargets()
 	unitscan_zone_targets()
-	if unitscan.clear_seen_guids then
-		unitscan.clear_seen_guids()
-	end
 	if unitscan.rebuild_scan_queue then
 		unitscan.rebuild_scan_queue()
 	end
@@ -243,14 +223,11 @@ end
 -- Scanning core
 --
 -- Scan strategies, chosen automatically:
---   1. Event-driven + fast nameplate scan (MODS.ClassicAPI) — hooks
---      NAME_PLATE_UNIT_ADDED for instant detection plus a 0.25s zero-alloc
---      safety-net sweep over pre-allocated nameplate tokens. Never touches
---      your real target and works even while you have one.
---   2. Passive long-range GUID scan (MODS.Nampower / MODS.SuperWoW) — listens
---      to unit GUID events and UNIT_CASTEVENT with a TTL cache to catch rares
---      outside nameplate range without TargetByName or FPS drops.
---   3. Time-sliced legacy TargetByName flicker-scan — fallback when nameplate
+--   1. Event-driven + zero-alloc nameplate scan (MODS.ClassicAPI) — hooks
+--      NAME_PLATE_UNIT_ADDED for instant detection plus a 0.5s (1.0s inside
+--      dungeons/raids) zero-alloc safety-net sweep over pre-allocated
+--      nameplate tokens. Never touches your real target.
+--   2. Time-sliced legacy TargetByName flicker-scan — fallback when nameplate
 --      tokens aren't available; spreads checks across frames (2 per 0.05s
 --      tick) instead of stalling a single frame with the full zone list.
 ------------------------------------------------------------------------------
@@ -262,23 +239,10 @@ do
 	local _UIErrorsFrame_OnEvent = UIErrorsFrame_OnEvent
 	local pass = function() end
 
-	-- Passive GUID cache for Nampower/SuperWoW long-range event detection.
-	local seenGuids = {}
-	local seenGuidCount = 0
-	local SEEN_GUID_MAX = 400
-	local SEEN_GUID_TTL = 15
-
 	-- Time-sliced queue for legacy TargetByName fallback.
 	local scanQueue = {}
 	local scanQueueLen = 0
 	local scanCursor = 1
-
-	function unitscan.clear_seen_guids()
-		for k in pairs(seenGuids) do
-			seenGuids[k] = nil
-		end
-		seenGuidCount = 0
-	end
 
 	function unitscan.rebuild_scan_queue()
 		local idx = 0
@@ -447,32 +411,11 @@ do
 		evaluate_unit(unit, UnitName(unit))
 	end
 
-	-- Passive GUID path (Nampower / SuperWoW): checks a unit by GUID once per
-	-- TTL window, catching rares beyond nameplate range with near-zero CPU cost.
-	function unitscan.check_guid(guid)
-		if not guid then return end
-		local now = GetTime()
-		local seenAt = seenGuids[guid]
-		if seenAt and (now - seenAt) < SEEN_GUID_TTL then
-			return
-		end
-		if seenGuidCount >= SEEN_GUID_MAX then
-			unitscan.clear_seen_guids()
-		end
-		if not seenAt then
-			seenGuidCount = seenGuidCount + 1
-		end
-		seenGuids[guid] = now
-
-		if not UnitExists(guid) then return end
-		evaluate_unit(guid, UnitName(guid))
-	end
-
-	-- Strategy 1: nameplate scan (polling sweep running every 0.25s as a
-	-- fast safety net alongside NAME_PLATE_UNIT_ADDED). Uses pre-allocated
-	-- token strings and skips the loop when C_NamePlate reports 0 plates.
+	-- Strategy 1: nameplate scan (polling sweep running every 0.5s open-world
+	-- or 1.0s in instances as a safety net alongside NAME_PLATE_UNIT_ADDED).
+	-- Zero GC allocation; skips immediately when both target lists are empty.
 	local function nameplate_scan()
-		if HAS_GET_NAMEPLATES and table.getn(C_NamePlate.GetNamePlates()) == 0 then
+		if next(unitscan_targets) == nil and (not unitscan_zonetargets or next(unitscan_zonetargets) == nil) then
 			return
 		end
 		for i = 1, MAX_NAMEPLATES do
@@ -828,12 +771,9 @@ function unitscan.LOAD()
 		tostring(MODS.ClassicAPI), tostring(MODS.SuperWoW), tostring(MODS.Nampower),
 		tostring(MODS.UnitXP), tostring(MODS.VanillaHelpers)))
 	if MODS.ClassicAPI then
-		unitscan.print("using nameplate scan (0.25s) + instant NAME_PLATE_UNIT_ADDED")
+		unitscan.print("using nameplate scan (0.5s open-world / 1.0s instance) + instant NAME_PLATE_UNIT_ADDED")
 	else
 		unitscan.print("using time-sliced TargetByName scan (install ClassicAPI to remove target flicker)")
-	end
-	if MODS.Nampower or MODS.SuperWoW then
-		unitscan.print("passive long-range GUID scan enabled")
 	end
 end
 
@@ -853,7 +793,12 @@ do
 				end
 			end
 
-			local interval = MODS.ClassicAPI and CHECK_INTERVAL or LEGACY_TICK_INTERVAL
+			local interval
+			if MODS.ClassicAPI then
+				interval = unitscan.inInstance and INSTANCE_CHECK_INTERVAL or CHECK_INTERVAL
+			else
+				interval = LEGACY_TICK_INTERVAL
+			end
 			if now - unitscan.last_check >= interval then
 				unitscan.last_check = now
 				if (unitscan.reloadtimer and (now >= unitscan.reloadtimer)) then
@@ -1056,16 +1001,12 @@ SLASH_UNITSCANMODS1 = "/unitscanmods"
 function SlashCmdList.UNITSCANMODS(msg)
 	unitscan.print("===== Detected mods =====")
 	unitscan.print("ClassicAPI (nameplate scan, instant NAME_PLATE_UNIT_ADDED, native range/LOS): " .. tostring(MODS.ClassicAPI))
-	unitscan.print("SuperWoW (GUIDs, mark1-8, UNIT_CASTEVENT long-range scan): " .. tostring(MODS.SuperWoW))
-	unitscan.print("nampower (GUIDs, UNIT_DIED, UNIT_*_GUID long-range scan): " .. tostring(MODS.Nampower))
+	unitscan.print("SuperWoW (GUIDs, mark1-8): " .. tostring(MODS.SuperWoW))
+	unitscan.print("nampower (GUIDs, UNIT_DIED): " .. tostring(MODS.Nampower))
 	unitscan.print("UnitXP_SP3 (range/LOS fallback, taskbar/sound alert): " .. tostring(MODS.UnitXP))
 	unitscan.print("VanillaHelpers (minimap blip on found unit): " .. tostring(MODS.VanillaHelpers))
 	unitscan.print("Native TargetUnit/SetRaidTarget available: " .. tostring(CAN_TARGETUNIT) .. " / " .. tostring(CAN_MARK))
-	local method = MODS.ClassicAPI and "event-driven + 0.25s nameplate scan" or "time-sliced TargetByName scan"
-	if MODS.Nampower or MODS.SuperWoW then
-		method = method .. " + passive GUID scan"
-	end
-	unitscan.print("Scan method in use: " .. method)
+	unitscan.print("Scan method in use: " .. (MODS.ClassicAPI and "event-driven + zero-alloc nameplate scan" or "time-sliced TargetByName scan"))
 end
 
 SLASH_UNITSCANHELP1 = "/unitscanhelp"
